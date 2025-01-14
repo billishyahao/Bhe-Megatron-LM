@@ -67,7 +67,7 @@ MBS="${MBS:-1}"
 GBS="${GBS:-128}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
-TOTAL_ITERS="${TOTAL_ITERS:-20}"
+TOTAL_ITERS="${TOTAL_ITERS:-5}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
 OPTIMIZER="${OPTIMIZER:-adam}"
@@ -85,12 +85,15 @@ mkdir -p $EXPERIMENT_DIR
 
 DATA_PATH=../../../fineweb-edu/fineweb-edu-train_text_document
 
+
 if [ $MODEL_SIZE = 8 ]; then
-TOKENIZER_MODEL=./tokenizers/Llama-3.1-8B
+TOKENIZER_MODEL=examples/llama/tokenizers/Llama-3.1-8B
 elif [ $MODEL_SIZE = 70 ]; then
-TOKENIZER_MODEL=./tokenizers/Llama-3.1-70B
+TOKENIZER_MODEL=examples/llama/tokenizers/Llama-3.1-70B
 elif [ $MODEL_SIZE = 7 ]; then
-TOKENIZER_MODEL=./oscar-dataset/llama-tokenizer
+TOKENIZER_MODEL=examples/llama/tokenizers/Llama-2-7B/llama-tokenizer
+elif [ $MODEL_SIZE = 405 ]; then
+TOKENIZER_MODEL=examples/llama/tokenizers/Llama-3.1-405B
 fi
 
 DEFAULT_LOG_DIR="${EXPERIMENT_DIR}/${NNODES}nodes_rank${NODE_RANK}_train_${MODEL_SIZE}B_mbs${MBS}_gbs${GBS}_seqlen${SEQ_LENGTH}_tp${TP}_pp${PP}_cp${CP}_iter${TOTAL_ITERS}_SL_${SEQ_PARALLEL}_AC_${AC}_DO_${DO}_FL_${FL}_TE_${TE}/nocompile${NO_TORCH_COMPILE}_TE_FP8_${TE_FP8}/${TIME_STAMP}"
@@ -137,6 +140,15 @@ FFN_HIDDEN_SIZE=11008
 NUM_LAYERS=32
 NUM_HEADS=32
 NUM_KV_HEADS=32
+
+elif [ $MODEL_SIZE = 405 ]; then
+
+HIDDEN_SIZE=16384 
+FFN_HIDDEN_SIZE=53248
+NUM_LAYERS=2 # e.g. llama-405B 126 layers, for 16 layers, 50B model size
+NUM_HEADS=128
+NUM_KV_HEADS=8
+MAX_POSITION_EMBEDDINGS=131072
 
 fi
 
@@ -233,9 +245,9 @@ EXTRA_ARGS="
     --num-query-groups $NUM_GROUPS \
     --distributed-timeout-minutes 120 \
     --overlap-grad-reduce \
+    --no-gradient-accumulation-fusion \
 "
 
-    # --no-gradient-accumulation-fusion \
 
 if [ $AC = full ]; then
     EXTRA_ARGS="$EXTRA_ARGS --recompute-method uniform --recompute-granularity full --recompute-num-layers ${RECOMPUTE_NUM_LAYERS}"
@@ -282,7 +294,7 @@ if [ "$TE_FP8" -eq 1 ]; then
 fi
 
 run_cmd="
-    torchrun $DISTRIBUTED_ARGS ../../pretrain_gpt.py \
+    torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
         $GPT_ARGS \
         $DATA_ARGS \
         $OUTPUT_ARGS \
@@ -290,4 +302,18 @@ run_cmd="
         $TRAIN_ARGS \
 "
 
+run_cmd="$run_cmd 2>&1 | tee $TRAIN_LOG"
+
 eval $run_cmd
+
+echo '============================================================================================================' |& tee -a $TRAIN_LOG
+PERFORMANCE=$(grep -Eo 'throughput per GPU [^|]*' $TRAIN_LOG | sed -E 's/.*throughput per GPU \(TFLOP\/s\/GPU\): ([0-9\.]+).*/\1/' |  awk 'NR > 2 { sum += $1; count++ } END { if (count > 0) printf sum / count }')
+echo "throughput per GPU: $PERFORMANCE" |& tee -a $TRAIN_LOG
+
+ETPI=$(grep -Eo 'elapsed time per iteration [^|]*' $TRAIN_LOG | sed -E 's/.*elapsed time per iteration \(ms\): ([0-9\.]+).*/\1/' |  awk 'NR > 2 { sum += $1; count++ } END { if (count > 0) print sum / count }')
+echo "elapsed time per iteration: $ETPI" |& tee -a $TRAIN_LOG
+
+TGS=$(awk -v gbs="$GBS" -v sl="$SEQ_LENGTH" -v tpi="$ETPI" -v ws="$WORLD_SIZE" 'BEGIN {printf "%.6f", gbs * sl * 1000/ (tpi * ws)}')
+echo "tokens/GPU/s: $TGS" |& tee -a $TRAIN_LOG
+echo '============================================================================================================' |& tee -a $TRAIN_LOG
+
